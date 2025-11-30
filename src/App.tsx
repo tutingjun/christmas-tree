@@ -6,6 +6,7 @@ import {
   useCallback,
   Suspense,
 } from "react";
+import type { FormEvent } from "react";
 import { Canvas, useFrame, extend } from "@react-three/fiber";
 import {
   OrbitControls,
@@ -26,6 +27,13 @@ import {
   FilesetResolver,
   DrawingUtils,
 } from "@mediapipe/tasks-vision";
+
+type AuthState = "checking" | "authed" | "unauthenticated";
+type AudioStatus = "idle" | "playing" | "paused" | "error";
+
+const FONT_STACK =
+  '"PingFang SC","Noto Sans SC","Microsoft YaHei","Helvetica Neue",Arial,sans-serif';
+const AUDIO_VOLUME = 0.7;
 
 // --- 动态生成照片列表 (top.jpg + 1.jpg 到 31.jpg) ---
 const TOTAL_NUMBERED_PHOTOS = 31;
@@ -63,10 +71,10 @@ const CONFIG = {
     candyColors: ["#FF0000", "#FFFFFF"],
   },
   counts: {
-    foliage: 15000,
-    ornaments: 300, // 拍立得照片数量
-    elements: 300, // 圣诞元素数量
-    lights: 520, // 彩灯数量
+    foliage: 12000, // 降低颗粒数提升帧率
+    ornaments: 240, // 拍立得照片数量
+    elements: 240, // 圣诞元素数量
+    lights: 420, // 彩灯数量
   },
   tree: { height: 32, radius: 14 }, // 树体尺寸
   photos: {
@@ -174,7 +182,7 @@ const PhotoOrnaments = ({ state }: { state: "CHAOS" | "FORMED" }) => {
   const count = CONFIG.counts.ornaments;
   const groupRef = useRef<THREE.Group>(null);
   // Open palm -> CHAOS -> make the photos pop larger.
-  const sizeMultiplier = state === "CHAOS" ? 1.5 : 1;
+  const sizeMultiplier = state === "CHAOS" ? 1.8 : 1;
 
   const borderGeometry = useMemo(() => new THREE.PlaneGeometry(1.2, 1.5), []);
   const photoGeometry = useMemo(() => new THREE.PlaneGeometry(1, 1), []);
@@ -910,6 +918,115 @@ const GestureController = ({ onGesture, onMove, onStatus, debugMode }: any) => {
 
 // --- App Entry ---
 export default function GrandTreeApp() {
+  const [authState, setAuthState] = useState<AuthState>("checking");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [credentials, setCredentials] = useState({
+    username: "",
+    password: "",
+  });
+  const [audioStatus, setAudioStatus] = useState<AudioStatus>("idle");
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const res = await fetch("/api/login");
+        if (!res.ok) {
+          setAuthState("unauthenticated");
+          return;
+        }
+        await res.json();
+        setAuthState("authed");
+      } catch (err) {
+        console.error("Auth check failed", err);
+        setAuthState("unauthenticated");
+      }
+    };
+    checkAuth();
+  }, []);
+
+  const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setSubmitting(true);
+    setAuthError(null);
+    try {
+      const res = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(credentials),
+      });
+      if (!res.ok) {
+        const payload = (await res.json().catch(() => ({}))) as {
+          error?: string;
+        };
+        setAuthError(payload?.error || "Invalid credentials");
+        setAuthState("unauthenticated");
+        return;
+      }
+      await res.json();
+      setAuthState("authed");
+    } catch (err) {
+      console.error("Login failed", err);
+      setAuthError("Network error. Please try again.");
+      setAuthState("unauthenticated");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const ensureAudio = useCallback(
+    async (options?: { silentAttempt?: boolean }) => {
+      if (!audioRef.current) {
+        const audio = new Audio("/background.mp3");
+        audio.loop = true;
+        audio.volume = AUDIO_VOLUME;
+        audioRef.current = audio;
+      }
+      try {
+        await audioRef.current.play();
+        setAudioStatus("playing");
+      } catch (err) {
+        console.error("Audio play failed", err);
+        if (!options?.silentAttempt) {
+          setAudioStatus("error");
+        }
+      }
+    },
+    []
+  );
+
+  const toggleAudio = useCallback(async () => {
+    if (audioStatus === "playing") {
+      audioRef.current?.pause();
+      setAudioStatus("paused");
+      return;
+    }
+    await ensureAudio();
+  }, [audioStatus, ensureAudio]);
+
+  useEffect(() => {
+    // Try autoplay once after通过认证；若被拦截，不影响后续手势解锁。
+    if (authState !== "authed" || audioStatus !== "idle") return;
+    ensureAudio({ silentAttempt: true });
+  }, [authState, audioStatus, ensureAudio]);
+
+  useEffect(() => {
+    // Attach a one-time listener so the first user gesture unlocks audio reliably.
+    if (audioStatus !== "idle" || authState !== "authed") return;
+    const onFirstGesture = async () => {
+      await ensureAudio();
+      window.removeEventListener("pointerdown", onFirstGesture);
+      window.removeEventListener("keydown", onFirstGesture);
+    };
+    window.addEventListener("pointerdown", onFirstGesture, { once: true });
+    window.addEventListener("keydown", onFirstGesture, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", onFirstGesture);
+      window.removeEventListener("keydown", onFirstGesture);
+    };
+  }, [authState, audioStatus, ensureAudio]);
+
   const [sceneState, setSceneState] = useState<"CHAOS" | "FORMED">("CHAOS");
   const baseSpin = sceneState === "CHAOS" ? 0.03 : 0.01;
   const [rotationSpeed, setRotationSpeed] = useState(baseSpin);
@@ -927,6 +1044,155 @@ export default function GrandTreeApp() {
   useEffect(() => {
     setRotationSpeed(baseSpin);
   }, [baseSpin]);
+
+  if (authState !== "authed") {
+    return (
+      <div
+        style={{
+          width: "100vw",
+          height: "100vh",
+          background:
+            "radial-gradient(circle at 20% 20%, rgba(255,215,0,0.08), transparent 30%), radial-gradient(circle at 80% 80%, rgba(0,100,0,0.2), transparent 30%), #020b0a",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: "#f7f7f7",
+          fontFamily: FONT_STACK,
+          padding: "24px",
+        }}
+      >
+        <div
+          style={{
+            width: "100%",
+            maxWidth: "440px",
+            background: "rgba(10, 20, 18, 0.8)",
+            border: "1px solid rgba(255, 215, 0, 0.2)",
+            borderRadius: "16px",
+            padding: "28px",
+            boxShadow:
+              "0 30px 80px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255,255,255,0.03)",
+            backdropFilter: "blur(10px)",
+          }}
+        >
+          <div style={{ marginBottom: "18px" }}>
+            <p
+              style={{
+                letterSpacing: "3px",
+                fontSize: "10px",
+                color: "rgba(255, 215, 0, 0.7)",
+                textTransform: "uppercase",
+                marginBottom: "6px",
+              }}
+            >
+              Private Access
+            </p>
+            <h1
+              style={{
+                fontSize: "26px",
+                margin: 0,
+                lineHeight: 1.2,
+                color: "#f3f3f3",
+                fontWeight: 700,
+              }}
+            >
+              🎄圣诞节快乐
+            </h1>
+          </div>
+
+          <form onSubmit={handleLogin} style={{ display: "grid", gap: "12px" }}>
+            <label style={{ display: "grid", gap: "6px" }}>
+              <span style={{ fontSize: "12px", color: "#cbd4d0" }}>用户名</span>
+              <input
+                type="text"
+                value={credentials.username}
+                onChange={(e) =>
+                  setCredentials((prev) => ({
+                    ...prev,
+                    username: e.target.value,
+                  }))
+                }
+                required
+                style={{
+                  width: "100%",
+                  padding: "12px 14px",
+                  borderRadius: "10px",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  backgroundColor: "rgba(0,0,0,0.35)",
+                  color: "#fff",
+                  outline: "none",
+                  fontSize: "14px",
+                }}
+              />
+            </label>
+
+            <label style={{ display: "grid", gap: "6px" }}>
+              <span style={{ fontSize: "12px", color: "#cbd4d0" }}>密码</span>
+              <input
+                type="password"
+                value={credentials.password}
+                onChange={(e) =>
+                  setCredentials((prev) => ({
+                    ...prev,
+                    password: e.target.value,
+                  }))
+                }
+                required
+                style={{
+                  width: "100%",
+                  padding: "12px 14px",
+                  borderRadius: "10px",
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  backgroundColor: "rgba(0,0,0,0.35)",
+                  color: "#fff",
+                  outline: "none",
+                  fontSize: "14px",
+                }}
+              />
+            </label>
+
+            {authError ? (
+              <div
+                style={{
+                  backgroundColor: "rgba(255, 64, 64, 0.08)",
+                  border: "1px solid rgba(255, 64, 64, 0.4)",
+                  color: "#ff8a8a",
+                  borderRadius: "10px",
+                  padding: "10px 12px",
+                  fontSize: "13px",
+                }}
+              >
+                {authError}
+              </div>
+            ) : null}
+
+            <button
+              type="submit"
+              disabled={submitting}
+              style={{
+                marginTop: "6px",
+                width: "100%",
+                padding: "12px 14px",
+                borderRadius: "10px",
+                border: "none",
+                background:
+                  "linear-gradient(135deg, #0bbf6b 0%, #38a169 50%, #f6e05e 100%)",
+                color: "#0a1f1a",
+                fontWeight: 700,
+                fontSize: "14px",
+                letterSpacing: "0.6px",
+                cursor: submitting ? "not-allowed" : "pointer",
+                boxShadow: "0 15px 30px rgba(0, 255, 170, 0.15)",
+                opacity: submitting ? 0.6 : 1,
+                transition: "transform 0.15s ease, box-shadow 0.2s ease",
+              }}
+            >
+              {submitting ? "登陆中..." : "登陆"}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -949,7 +1215,7 @@ export default function GrandTreeApp() {
         }}
       >
         <Canvas
-          dpr={[1, 2]}
+          dpr={[1, 1.5]} // 降低像素比以提升帧率
           gl={{ toneMapping: THREE.ReinhardToneMapping }}
           shadows
         >
@@ -971,20 +1237,20 @@ export default function GrandTreeApp() {
           left: "40px",
           color: "#888",
           zIndex: 10,
-          fontFamily: "sans-serif",
+          fontFamily: FONT_STACK,
           userSelect: "none",
         }}
       >
         <div style={{ marginBottom: "15px" }}>
           <p
             style={{
-              fontSize: "10px",
+              fontSize: "15px",
               letterSpacing: "2px",
               textTransform: "uppercase",
               marginBottom: "4px",
             }}
           >
-            Memories
+            回忆
           </p>
           <p
             style={{
@@ -994,38 +1260,11 @@ export default function GrandTreeApp() {
               margin: 0,
             }}
           >
-            {CONFIG.counts.ornaments.toLocaleString()}{" "}
+            {TOTAL_NUMBERED_PHOTOS.toLocaleString()}{" "}
             <span
               style={{ fontSize: "10px", color: "#555", fontWeight: "normal" }}
             >
-              POLAROIDS
-            </span>
-          </p>
-        </div>
-        <div>
-          <p
-            style={{
-              fontSize: "10px",
-              letterSpacing: "2px",
-              textTransform: "uppercase",
-              marginBottom: "4px",
-            }}
-          >
-            Foliage
-          </p>
-          <p
-            style={{
-              fontSize: "24px",
-              color: "#004225",
-              fontWeight: "bold",
-              margin: 0,
-            }}
-          >
-            {(CONFIG.counts.foliage / 1000).toFixed(0)}K{" "}
-            <span
-              style={{ fontSize: "10px", color: "#555", fontWeight: "normal" }}
-            >
-              EMERALD NEEDLES
+              照片
             </span>
           </p>
         </div>
@@ -1043,32 +1282,17 @@ export default function GrandTreeApp() {
         }}
       >
         <button
-          onClick={() => setDebugMode(!debugMode)}
+          onClick={toggleAudio}
           style={{
             padding: "12px 15px",
-            backgroundColor: debugMode ? "#FFD700" : "rgba(0,0,0,0.5)",
-            border: "1px solid #FFD700",
-            color: debugMode ? "#000" : "#FFD700",
-            fontFamily: "sans-serif",
-            fontSize: "12px",
-            fontWeight: "bold",
-            cursor: "pointer",
-            backdropFilter: "blur(4px)",
-          }}
-        >
-          {debugMode ? "HIDE DEBUG" : "🛠 DEBUG"}
-        </button>
-        <button
-          onClick={() =>
-            setSceneState((s) => (s === "CHAOS" ? "FORMED" : "CHAOS"))
-          }
-          style={{
-            padding: "12px 30px",
-            backgroundColor: "rgba(0,0,0,0.5)",
-            border: "1px solid rgba(255, 215, 0, 0.5)",
-            color: "#FFD700",
-            fontFamily: "serif",
-            fontSize: "14px",
+            backgroundColor:
+              audioStatus === "playing"
+                ? "rgba(15, 178, 102, 0.9)"
+                : "rgba(0,0,0,0.5)",
+            border: "1px solid rgba(15, 178, 102, 0.9)",
+            color: audioStatus === "playing" ? "#02130d" : "#9ef7ca",
+            fontFamily: FONT_STACK,
+            fontSize: "15x",
             fontWeight: "bold",
             letterSpacing: "3px",
             textTransform: "uppercase",
@@ -1076,7 +1300,53 @@ export default function GrandTreeApp() {
             backdropFilter: "blur(4px)",
           }}
         >
-          {sceneState === "CHAOS" ? "Assemble Tree" : "Disperse"}
+          {audioStatus === "playing"
+            ? "🔊 暂停"
+            : audioStatus === "error"
+            ? "🔊 播放失败"
+            : audioStatus === "paused"
+            ? "🔊 继续"
+            : "🔊 播放"}
+        </button>
+
+        <button
+          onClick={() => setDebugMode(!debugMode)}
+          style={{
+            padding: "12px 15px",
+            backgroundColor: debugMode ? "#FFD700" : "rgba(0,0,0,0.5)",
+            border: "1px solid #FFD700",
+            color: debugMode ? "#000" : "#FFD700",
+            fontFamily: FONT_STACK,
+            fontSize: "15x",
+            fontWeight: "bold",
+            letterSpacing: "3px",
+            textTransform: "uppercase",
+            cursor: "pointer",
+            backdropFilter: "blur(4px)",
+          }}
+        >
+          {debugMode ? "📸 隐藏" : "📸 开启"}
+        </button>
+
+        <button
+          onClick={() =>
+            setSceneState((s) => (s === "CHAOS" ? "FORMED" : "CHAOS"))
+          }
+          style={{
+            padding: "12px 15px",
+            backgroundColor: "rgba(0,0,0,0.5)",
+            border: "1px solid rgba(255, 215, 0, 0.5)",
+            color: "#FFD700",
+            fontFamily: FONT_STACK,
+            fontSize: "15x",
+            fontWeight: "bold",
+            letterSpacing: "3px",
+            textTransform: "uppercase",
+            cursor: "pointer",
+            backdropFilter: "blur(4px)",
+          }}
+        >
+          {sceneState === "CHAOS" ? "🎄 组合" : "🎄 分散"}
         </button>
       </div>
 
